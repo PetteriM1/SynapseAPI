@@ -1,10 +1,18 @@
-#name, main, version and api are required
 name: SynapseAPI
 main: org.itxtech.synapseapi.SynapseAPI
-#remember version and api is string, don't write it like this: 1.0.0, or there will be an exception
 version: "2.0.0"
 api: ["1.0.0"]
 
 load: STARTUP
 author: iTXTech
 description: The basic APIs provide for Synapse Client
+
+commands:
+  transfer:
+    description: Switch server
+    usage: "/transfer <description>"
+    permission: synapse.transfer
+permissions:
+  synapse.transfer:
+    description: "Allows player to transfer to other server"
+    default: true
