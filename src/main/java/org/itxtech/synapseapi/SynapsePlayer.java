@@ -16,6 +16,7 @@ import cn.nukkit.math.NukkitMath;
 import cn.nukkit.nbt.tag.*;
 import cn.nukkit.network.SourceInterface;
 import cn.nukkit.network.protocol.*;
+import cn.nukkit.utils.MainLogger;
 import cn.nukkit.utils.TextFormat;
 import co.aikar.timings.Timing;
 import co.aikar.timings.TimingsManager;
@@ -27,18 +28,34 @@ import org.itxtech.synapseapi.utils.ClientData;
 import org.itxtech.synapseapi.utils.ClientData.Entry;
 import org.itxtech.synapseapi.utils.DataPacketEidReplacer;
 
+import java.io.File;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.*;
 
 /**
  * Created by boybook on 16/6/24.
  */
 public class SynapsePlayer extends Player {
+    private static final Method updateName;
+
+    public static final long REPLACE_ID = Long.MAX_VALUE;
 
     private static final Map<Byte, Timing> handlePlayerDataPacketTimings = new HashMap<>();
+
     public boolean isSynapseLogin = false;
     protected SynapseEntry synapseEntry;
     private boolean isFirstTimeLogin = false;
     private long synapseSlowLoginUntil = 0;
+
+    static {
+        try {
+            updateName = Server.class.getDeclaredMethod("updateName", UUID.class, String.class);
+            updateName.setAccessible(true);
+        } catch (NoSuchMethodException e) {
+            throw new RuntimeException(e);
+        }
+    }
 
     public SynapsePlayer(SourceInterface interfaz, SynapseEntry synapseEntry, Long clientID, String ip, int port) {
         super(interfaz, clientID, ip, port);
@@ -70,7 +87,7 @@ public class SynapsePlayer extends Player {
         this.server.getPluginManager().callEvent(ev = new SynapsePlayerConnectEvent(this, this.isFirstTimeLogin));
         if (!ev.isCancelled()) {
             DataPacket pk = SynapseAPI.getInstance().getPacket(packet.cachedLoginPacket);
-            pk.setOffset(3);
+            pk.setOffset(1);
             pk.decode();
             this.handleDataPacket(pk);
         }
@@ -119,11 +136,30 @@ public class SynapsePlayer extends Player {
             }
         }
 
-        CompoundTag nbt = this.server.getOfflinePlayerData(this.username);
+        CompoundTag nbt;
+        File legacyDataFile = new File(server.getDataPath() + "players/" + this.username.toLowerCase() + ".dat");
+        File dataFile = new File(server.getDataPath() + "players/" + this.uuid.toString() + ".dat");
+        if (legacyDataFile.exists() && !dataFile.exists()) {
+            nbt = this.server.getOfflinePlayerData(this.username);
+
+            if (!legacyDataFile.delete()) {
+                MainLogger.getLogger().warning("Could not delete legacy player data for " + this.username);
+            }
+        } else {
+            nbt = this.server.getOfflinePlayerData(this.uuid);
+        }
+
         if (nbt == null) {
             this.close(this.getLeaveMessage(), "Invalid data");
-
             return;
+        }
+
+        if (getLoginChainData().isXboxAuthed() && server.getPropertyBoolean("xbox-auth") || !server.getPropertyBoolean("xbox-auth")) {
+            try {
+                updateName.invoke(server, this.uuid, this.username);
+            } catch (IllegalAccessException | InvocationTargetException e) {
+                // TODO: 13/03/2019 Something here?
+            }
         }
 
         this.playedBefore = (nbt.getLong("lastPlayed") - nbt.getLong("firstPlayed")) > 1;
@@ -178,7 +214,7 @@ public class SynapsePlayer extends Player {
         nbt.putLong("lastPlayed", System.currentTimeMillis() / 1000);
 
         if (this.server.getAutoSave()) {
-            this.server.saveOfflinePlayerData(this.username, nbt, true);
+            this.server.saveOfflinePlayerData(this.uuid, nbt, true);
         }
 
         this.sendPlayStatus(PlayStatusPacket.LOGIN_SUCCESS);
@@ -243,8 +279,8 @@ public class SynapsePlayer extends Player {
         Position spawnPosition = this.getSpawn();
         if (this.isFirstTimeLogin) {
             StartGamePacket startGamePacket = new StartGamePacket();
-            startGamePacket.entityUniqueId = Long.MAX_VALUE;
-            startGamePacket.entityRuntimeId = Long.MAX_VALUE;
+            startGamePacket.entityUniqueId = REPLACE_ID;
+            startGamePacket.entityRuntimeId = REPLACE_ID;
             startGamePacket.playerGamemode = getClientFriendlyGamemode(this.gamemode);
             startGamePacket.x = (float) this.x;
             startGamePacket.y = (float) this.y;
@@ -277,11 +313,7 @@ public class SynapsePlayer extends Player {
             newSettings.set(Type.ALLOW_FLIGHT, (gamemode & 0x01) > 0);
             newSettings.set(Type.NO_CLIP, gamemode == 0x03);
             newSettings.set(Type.FLYING, gamemode == 0x03);
-            if (this.isSpectator()) {
-                this.keepMovement = true;
-            } else {
-                this.keepMovement = false;
-            }
+            this.keepMovement = this.isSpectator();
             SetPlayerGameTypePacket pk = new SetPlayerGameTypePacket();
             pk.gamemode = getClientFriendlyGamemode(gamemode);
             this.dataPacket(pk);
@@ -349,7 +381,7 @@ public class SynapsePlayer extends Player {
                 pkList.add(chunk);
             }
         }
-        Server.getInstance().batchPackets(new Player[]{this}, pkList.stream().toArray(DataPacket[]::new));
+        Server.getInstance().batchPackets(new Player[]{this}, pkList.toArray(new DataPacket[0]));
     }
 
     public boolean transferByDescription(String serverDescription) {
@@ -433,31 +465,19 @@ public class SynapsePlayer extends Player {
     @Override
     public int dataPacket(DataPacket packet, boolean needACK) {
         if (!this.isSynapseLogin) return super.dataPacket(packet, needACK);
-        /*if (!this.isFirstTimeLogin && packet instanceof ResourcePacksInfoPacket) {
-            this.processLogin();
-            return -1;
-        }*/
-        packet = DataPacketEidReplacer.replace(packet, this.getId(), Long.MAX_VALUE);
 
-        DataPacketSendEvent ev = new DataPacketSendEvent(this, packet);
-        this.server.getPluginManager().callEvent(ev);
-        if (ev.isCancelled()) {
-            return -1;
-        }
-
-        if (!packet.isEncoded) {
-            packet.encode();
-            packet.isEncoded = true;
-        }
-
-        //this.server.getLogger().warning("Send to player: " + Binary.bytesToHexString(new byte[]{packet.getBuffer()[0]}) + "  len: " + packet.getBuffer().length);
-        return this.interfaz.putPacket(this, packet, needACK);
+        return sendDataPacket(packet, needACK, false);
     }
 
     @Override
     public int directDataPacket(DataPacket packet, boolean needACK) {
         if (!this.isSynapseLogin) return super.directDataPacket(packet, needACK);
-        packet = DataPacketEidReplacer.replace(packet, this.getId(), Long.MAX_VALUE);
+
+        return sendDataPacket(packet, needACK, true);
+    }
+
+    public int sendDataPacket(DataPacket packet, boolean needACK, boolean direct) {
+        packet = DataPacketEidReplacer.replace(packet, this.getId(), REPLACE_ID);
         DataPacketSendEvent ev = new DataPacketSendEvent(this, packet);
         this.server.getPluginManager().callEvent(ev);
         if (ev.isCancelled()) {
@@ -469,6 +489,6 @@ public class SynapsePlayer extends Player {
             packet.isEncoded = true;
         }
 
-        return this.interfaz.putPacket(this, packet, needACK, true);
+        return this.interfaz.putPacket(this, packet, needACK, direct);
     }
 }
